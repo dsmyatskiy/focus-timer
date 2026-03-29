@@ -130,30 +130,90 @@
     if (!ax) ax = new (window.AudioContext || window.webkitAudioContext)();
     return ax;
   }
+  // Call this on every user click to keep AudioContext alive
+  function unlockAudio() {
+    const c = gax();
+    if (c.state === "suspended") c.resume();
+  }
   function beep(type, vol, buf) {
-    const c = gax(), m = c.createGain();
-    m.gain.value = vol;
-    m.connect(c.destination);
-    if (type === "custom" && buf) {
-      const s = c.createBufferSource(); s.buffer = buf; s.connect(m); s.start(); return;
+    const c = gax();
+    // resume if browser suspended the context (autoplay policy)
+    const play = () => {
+      const m = c.createGain();
+      m.gain.value = vol;
+      m.connect(c.destination);
+      if (type === "custom" && buf) {
+        const s = c.createBufferSource(); s.buffer = buf; s.connect(m); s.start(); return;
+      }
+      const sets = {
+        bell:    [[523,0,1.2,"sine"],[659,0.18,1.0,"sine"],[784,0.36,1.0,"sine"],[1047,0.6,1.4,"sine"],[784,1.2,0.8,"sine"]],
+        digital: [[880,0,0.12,"square"],[1100,0.18,0.12,"square"],[880,0.36,0.12,"square"],[1320,0.54,0.15,"square"],[880,0.75,0.12,"square"],[1100,0.93,0.15,"square"]],
+        soft:    [[330,0,1.2,"sine"],[440,0.35,1.1,"sine"],[528,0.75,1.0,"sine"],[440,1.2,0.9,"sine"]],
+      }[type] || [];
+      sets.forEach(([f, d, dur, tp]) => {
+        const o = c.createOscillator(), g = c.createGain();
+        o.type = tp; o.frequency.value = f; o.connect(g); g.connect(m);
+        const t = c.currentTime + d;
+        g.gain.setValueAtTime(0.0001, t);
+        g.gain.exponentialRampToValueAtTime(0.5, t + 0.01);
+        g.gain.exponentialRampToValueAtTime(0.0001, t + dur);
+        o.start(t); o.stop(t + dur + 0.02);
+      });
+    };
+    if (c.state === "suspended") {
+      c.resume().then(play);
+    } else {
+      play();
     }
-    const sets = {
-      bell:    [[523,0,0.45,"sine"],[659,0.14,0.4,"sine"],[784,0.28,0.4,"sine"],[1047,0.46,0.5,"sine"]],
-      digital: [[880,0,0.07,"square"],[1100,0.14,0.07,"square"],[880,0.28,0.07,"square"],[1320,0.42,0.09,"square"]],
-      soft:    [[330,0,0.5,"sine"],[440,0.22,0.45,"sine"],[528,0.5,0.4,"sine"]],
-    }[type] || [];
-    sets.forEach(([f, d, dur, tp]) => {
-      const o = c.createOscillator(), g = c.createGain();
-      o.type = tp; o.frequency.value = f; o.connect(g); g.connect(m);
-      const t = c.currentTime + d;
-      g.gain.setValueAtTime(0.0001, t);
-      g.gain.exponentialRampToValueAtTime(0.5, t + 0.01);
-      g.gain.exponentialRampToValueAtTime(0.0001, t + dur);
-      o.start(t); o.stop(t + dur + 0.02);
-    });
   }
 
-  // ── ConfirmModal ──────────────────────────────────────────────
+  // ── favicon ───────────────────────────────────────────────────
+  function setFavicon(mode, running) {
+    const canvas = document.createElement("canvas");
+    canvas.width = canvas.height = 32;
+    const ctx = canvas.getContext("2d");
+    const color = mode === "pomo" ? "#e2c97e" : mode === "short" ? "#7eb8e2" : "#7ee2a0";
+    // background circle
+    ctx.beginPath();
+    ctx.arc(16, 16, 15, 0, Math.PI * 2);
+    ctx.fillStyle = "#2a2d35";
+    ctx.fill();
+    // ring
+    ctx.beginPath();
+    ctx.arc(16, 16, 13, 0, Math.PI * 2);
+    ctx.strokeStyle = "rgba(255,255,255,0.12)";
+    ctx.lineWidth = 3;
+    ctx.stroke();
+    // accent dot or pause bars
+    if (!running) {
+      // two pause bars
+      ctx.fillStyle = color;
+      ctx.fillRect(10, 10, 4, 12);
+      ctx.fillRect(18, 10, 4, 12);
+    } else {
+      // play triangle
+      ctx.beginPath();
+      ctx.moveTo(12, 9); ctx.lineTo(23, 16); ctx.lineTo(12, 23);
+      ctx.closePath();
+      ctx.fillStyle = color;
+      ctx.fill();
+    }
+    let link = document.querySelector("link[rel~='icon']");
+    if (!link) { link = document.createElement("link"); link.rel = "icon"; document.head.appendChild(link); }
+    link.href = canvas.toDataURL();
+  }
+
+  // ── notifications ─────────────────────────────────────────────
+  function requestNotifPerm() {
+    if ("Notification" in window && Notification.permission === "default") {
+      Notification.requestPermission();
+    }
+  }
+  function sendNotif(title, body) {
+    if ("Notification" in window && Notification.permission === "granted") {
+      try { new Notification(title, { body }); } catch {}
+    }
+  }
   function ConfirmModal({ onConfirm, onCancel }) {
     return h("div", { style: { position:"absolute",inset:0,background:"rgba(20,22,28,0.88)",borderRadius:20,display:"flex",alignItems:"center",justifyContent:"center",zIndex:10 } },
       h("div", { style: { background:CARD,border:`1px solid ${BORDER}`,borderRadius:14,padding:"28px 28px 22px",maxWidth:260,width:"90%",textAlign:"center" } },
@@ -172,11 +232,26 @@
   function App() {
     const D = CFG.defaults;
 
+    // restore timer state: compute elapsed time since page was closed
+    const initTimer = () => {
+      const saved = ls("pomo_timer", null);
+      if (!saved) return { mode: "pomo", tL: D.pomo * 60, tT: D.pomo * 60, wasRunning: false };
+      const { mode: m, tT, tL: savedTL, baseLeft, startedAt, wasRunning } = saved;
+      const safeTT = tT || D.pomo * 60;
+      if (wasRunning && startedAt && baseLeft != null) {
+        const elapsed = Math.floor((Date.now() - startedAt) / 1000);
+        const remaining = Math.max(0, baseLeft - elapsed);
+        return { mode: m || "pomo", tL: remaining, tT: safeTT, wasRunning: remaining > 0 };
+      }
+      return { mode: m || "pomo", tL: savedTL ?? safeTT, tT: safeTT, wasRunning: false };
+    };
+
+    const init = initTimer();
     const [cfg,      setCfg]      = useState(() => ls("pomo_cfg", { pomo: D.pomo, short: D.short, long: D.long, cycle: D.cycle }));
-    const [mode,     setMode]     = useState("pomo");
-    const [tL,       setTL]       = useState(() => { const c = ls("pomo_cfg", D); return c.pomo * 60; });
-    const [tT,       setTT]       = useState(() => { const c = ls("pomo_cfg", D); return c.pomo * 60; });
-    const [run,      setRun]      = useState(false);
+    const [mode,     setMode]     = useState(init.mode);
+    const [tL,       setTL]       = useState(init.tL);
+    const [tT,       setTT]       = useState(init.tT);
+    const [run,      setRun]      = useState(init.wasRunning);
     const [total,    setTotal]    = useState(() => ls("pomo_total", 0));
     const [cyc,      setCyc]      = useState(() => ls("pomo_cyc", 0));
     const [showSet,  setShowSet]  = useState(false);
@@ -208,6 +283,34 @@
     useEffect(() => lss("pomo_snd",   snd),   [snd]);
     useEffect(() => lss("pomo_vol",   vol),   [vol]);
 
+    // save startedAt only when run toggles, not on every tick
+    useEffect(() => {
+      const saved = ls("pomo_timer", {});
+      if (run) {
+        // record the moment we started and how many seconds were left at that moment
+        lss("pomo_timer", { ...saved, mode, tT, startedAt: Date.now(), baseLeft: tL, wasRunning: true });
+      } else {
+        lss("pomo_timer", { ...saved, mode, tT, tL, startedAt: null, wasRunning: false });
+      }
+    }, [run]); // eslint-disable-line
+
+    // keep mode/tT in sync (but not tL — that would overwrite the running baseline)
+    useEffect(() => {
+      if (!run) lss("pomo_timer", { ...ls("pomo_timer", {}), mode, tT, tL, startedAt: null, wasRunning: false });
+    }, [mode, tT]); // eslint-disable-line
+
+    // update favicon
+    useEffect(() => { setFavicon(mode, run); }, [mode, run]);
+
+    const [notifPerm, setNotifPerm] = useState(() =>
+      "Notification" in window ? Notification.permission : "denied"
+    );
+    const askNotifPerm = () => {
+      if (!("Notification" in window)) return;
+      if (Notification.permission !== "default") return;
+      Notification.requestPermission().then(p => setNotifPerm(p));
+    };
+
     // update tab title
     useEffect(() => {
       document.title = run ? `${fmt(tL)} — ${MCFG[mode].tag}` : CFG.appName;
@@ -218,6 +321,7 @@
       const s = c || st.current.cfg;
       const sec = (m === "pomo" ? s.pomo : m === "short" ? s.short : s.long) * 60;
       setTL(sec); setTT(sec);
+      lss("pomo_timer", { mode: m, tL: sec, tT: sec, startedAt: null, wasRunning: false });
     };
 
     useEffect(() => {
@@ -225,9 +329,7 @@
       iRef.current = setInterval(() => {
         setTL(p => {
           if (p <= 1) {
-            clearInterval(iRef.current); setRun(false);
-            const { snd: s, vol: v, cbuf: b } = st.current;
-            beep(s, v, b);
+            clearInterval(iRef.current);
             endR.current = true;
             return 0;
           }
@@ -237,10 +339,20 @@
       return () => clearInterval(iRef.current);
     }, [run]);
 
+    // watch for timer end — runs after every render, fires once when endR is set
     useEffect(() => {
       if (!endR.current) return;
       endR.current = false;
-      const { mode: m, total: t, cyc: ic, cfg: c } = st.current;
+      setRun(false);
+      // play sound and send notification here, outside state updater
+      const { snd: s, vol: v, cbuf: b, mode: m } = st.current;
+      beep(s, v, b);
+      const notifText = m === "pomo"
+        ? { title: "Focus session done! 🍅", body: "Time for a break." }
+        : { title: "Break's over!", body: "Ready to focus again?" };
+      sendNotif(notifText.title, notifText.body);
+      // advance to next mode
+      const { total: t, cyc: ic, cfg: c } = st.current;
       if (m === "pomo") {
         const nt = t + 1, nc = ic + 1;
         setTotal(nt);
@@ -291,7 +403,7 @@
     const doReset  = () => { setTotal(0); setCyc(0); setConfirm(false); };
 
     const pct  = tT > 0 ? tL / tT : 1;
-    const R    = 92, C = 204, circ = 2 * Math.PI * R;
+    const R    = 108, C = 240, circ = 2 * Math.PI * R;
     const dots = Array.from({ length: cfg.cycle }, (_, i) => i < cyc);
 
     const ibtn = (extra = {}) => ({
@@ -314,10 +426,10 @@
       }
     }, symbol);
 
-    return h("div", { style: { minHeight:"100vh",background:BG,display:"flex",flexDirection:"column",alignItems:"center",padding:"22px 16px 52px",fontFamily:"'Outfit',sans-serif",color:TEXT } },
+    return h("div", { style: { minHeight:"100vh",background:BG,display:"flex",flexDirection:"column",alignItems:"center",padding:"28px 20px 60px",fontFamily:"'Outfit',sans-serif",color:TEXT } },
 
       // ── top bar ──
-      h("div", { style: { width:"100%",maxWidth:400,display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:24 } },
+      h("div", { style: { width:"100%",maxWidth:460,display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:28 } },
         h("div", { style: { display:"flex",alignItems:"center",gap:8 } },
           h("svg", { width:18,height:18,viewBox:"0 0 24 24",fill:"none" },
             h("circle", { cx:12,cy:12,r:10,fill:AC_DIM,stroke:AC,strokeWidth:1.5 }),
@@ -338,7 +450,7 @@
       ),
 
       // ── main card ──
-      h("div", { style: { width:"100%",maxWidth:400,background:CARD,borderRadius:20,border:`1px solid ${BORDER}`,overflow:"hidden",position:"relative" } },
+      h("div", { style: { width:"100%",maxWidth:460,background:CARD,borderRadius:22,border:`1px solid ${BORDER}`,overflow:"hidden",position:"relative" } },
 
         confirm && h(ConfirmModal, { onConfirm: doReset, onCancel: () => setConfirm(false) }),
 
@@ -346,7 +458,7 @@
         h("div", { style: { display:"flex",borderBottom:`1px solid ${BORDER}` } },
           MODES.map(m => h("button", {
             key: m,
-            style: { flex:1,padding:"13px 8px",border:"none",fontSize:13,fontWeight:mode===m?600:400,
+            style: { flex:1,padding:"15px 8px",border:"none",fontSize:14,fontWeight:mode===m?600:400,
               background:mode===m?INNER:"transparent",color:mode===m?AC:MUTED,
               borderBottom:mode===m?`2px solid ${AC}`:"2px solid transparent",
               fontFamily:"inherit",transition:"all 0.2s" },
@@ -354,39 +466,39 @@
           }, MCFG[m].label))
         ),
 
-        h("div", { style: { display:"flex",flexDirection:"column",alignItems:"center",padding:"32px 28px 28px" } },
+        h("div", { style: { display:"flex",flexDirection:"column",alignItems:"center",padding:"36px 32px 32px" } },
 
           // ring
-          h("div", { style: { position:"relative",width:C,height:C,marginBottom:20 } },
+          h("div", { style: { position:"relative",width:C,height:C,marginBottom:24 } },
             h("svg", { width:C,height:C,viewBox:`0 0 ${C} ${C}`,style:{ transform:"rotate(-90deg)" } },
-              h("circle", { cx:C/2,cy:C/2,r:R,fill:"none",stroke:INNER,strokeWidth:10 }),
-              h("circle", { cx:C/2,cy:C/2,r:R,fill:"none",stroke:DIM,strokeWidth:10,opacity:0.4 }),
-              h("circle", { cx:C/2,cy:C/2,r:R,fill:"none",stroke:AC,strokeWidth:10,strokeLinecap:"round",
+              h("circle", { cx:C/2,cy:C/2,r:R,fill:"none",stroke:INNER,strokeWidth:12 }),
+              h("circle", { cx:C/2,cy:C/2,r:R,fill:"none",stroke:DIM,strokeWidth:12,opacity:0.4 }),
+              h("circle", { cx:C/2,cy:C/2,r:R,fill:"none",stroke:AC,strokeWidth:12,strokeLinecap:"round",
                 strokeDasharray:circ,strokeDashoffset:circ*(1-pct),
                 style:{ transition:"stroke-dashoffset 0.9s linear" }
               })
             ),
             h("div", { style: { position:"absolute",inset:0,display:"flex",flexDirection:"column",alignItems:"center",justifyContent:"center" } },
-              h("div", { style: { fontFamily:"'JetBrains Mono',monospace",fontSize:54,fontWeight:700,letterSpacing:"-2px",lineHeight:1,color:TEXT } }, fmt(tL)),
-              h("div", { style: { fontSize:10,letterSpacing:"0.14em",color:DIM,marginTop:8,fontWeight:500 } }, MCFG[mode].tag)
+              h("div", { style: { fontFamily:"'JetBrains Mono',monospace",fontSize:64,fontWeight:700,letterSpacing:"-3px",lineHeight:1,color:TEXT } }, fmt(tL)),
+              h("div", { style: { fontSize:11,letterSpacing:"0.14em",color:DIM,marginTop:10,fontWeight:500 } }, MCFG[mode].tag)
             )
           ),
 
           // controls
-          h("div", { style: { display:"flex",alignItems:"center",gap:10,marginBottom:24 } },
+          h("div", { style: { display:"flex",alignItems:"center",gap:12,marginBottom:28 } },
             h("button", { style: ibtn(), title:"Restart", onClick: restart },
-              h("svg", { width:15,height:15,fill:"none",stroke:"currentColor",strokeWidth:2,viewBox:"0 0 24 24" },
+              h("svg", { width:16,height:16,fill:"none",stroke:"currentColor",strokeWidth:2,viewBox:"0 0 24 24" },
                 h("path",     { d:"M3 12a9 9 0 1 0 9-9 9 9 0 0 0-6.05 2.36" }),
                 h("polyline", { points:"1,7 3,12 8,10" })
               )
             ),
             h("button", {
-              style: { background:AC,border:"none",borderRadius:12,color:"#1c1a14",fontSize:15,fontWeight:700,
-                letterSpacing:"0.1em",padding:"14px 0",width:140,fontFamily:"inherit" },
-              onClick: () => { if (tL > 0) setRun(r => !r); }
+              style: { background:AC,border:"none",borderRadius:13,color:"#1c1a14",fontSize:16,fontWeight:700,
+                letterSpacing:"0.1em",padding:"16px 0",width:160,fontFamily:"inherit" },
+              onClick: () => { if (tL > 0) { unlockAudio(); askNotifPerm(); setRun(r => !r); } }
             }, run ? "PAUSE" : tL < tT && tL > 0 ? "RESUME" : "START"),
             h("button", { style: ibtn(), title:"Skip", onClick: skip },
-              h("svg", { width:15,height:15,fill:"currentColor",viewBox:"0 0 24 24" },
+              h("svg", { width:16,height:16,fill:"currentColor",viewBox:"0 0 24 24" },
                 h("polygon", { points:"5,4 14,12 5,20" }),
                 h("rect",    { x:17,y:4,width:2.5,height:16,rx:1 })
               )
@@ -394,26 +506,26 @@
           ),
 
           // cycle dots
-          h("div", { style: { display:"flex",gap:6,marginBottom:16 } },
+          h("div", { style: { display:"flex",gap:7,marginBottom:18 } },
             dots.map((done, i) => h("div", { key:i, style: {
-              width: done ? 20 : 7, height: 7, borderRadius: 4,
+              width: done ? 22 : 8, height: 8, borderRadius: 4,
               background: done ? AC : DIM,
               transition: "all 0.35s cubic-bezier(0.34,1.56,0.64,1)",
             }}))
           ),
 
           // counter row: − | [number] | +
-          h("div", { style: { display:"flex",alignItems:"center",gap:10 } },
+          h("div", { style: { display:"flex",alignItems:"center",gap:12 } },
             adjBtn(decTotal, "−"),
             h("button", {
               onClick: () => setConfirm(true),
               title: "Click to reset",
-              style: { background:"transparent",border:`1px solid ${BORDER}`,borderRadius:10,
-                padding:"6px 20px",cursor:"pointer",display:"flex",flexDirection:"column",
-                alignItems:"center",gap:1,fontFamily:"inherit",minWidth:90 }
+              style: { background:"transparent",border:`1px solid ${BORDER}`,borderRadius:11,
+                padding:"8px 24px",cursor:"pointer",display:"flex",flexDirection:"column",
+                alignItems:"center",gap:1,fontFamily:"inherit",minWidth:100 }
             },
-              h("span", { style: { fontFamily:"'JetBrains Mono',monospace",fontSize:26,fontWeight:700,color:AC,lineHeight:1 } }, total),
-              h("span", { style: { fontSize:10,color:DIM,letterSpacing:"0.06em",marginTop:2 } }, total === 1 ? "session" : "sessions")
+              h("span", { style: { fontFamily:"'JetBrains Mono',monospace",fontSize:30,fontWeight:700,color:AC,lineHeight:1 } }, total),
+              h("span", { style: { fontSize:11,color:DIM,letterSpacing:"0.06em",marginTop:3 } }, total === 1 ? "session" : "sessions")
             ),
             adjBtn(incTotal, "+")
           )
@@ -421,7 +533,7 @@
       ),
 
       // ── settings panel ──
-      showSet && h("div", { style: { width:"100%",maxWidth:400,background:CARD,borderRadius:16,border:`1px solid ${BORDER}`,padding:"22px 24px",marginTop:12 } },
+      showSet && h("div", { style: { width:"100%",maxWidth:460,background:CARD,borderRadius:16,border:`1px solid ${BORDER}`,padding:"22px 24px",marginTop:12 } },
         h("p", { style: { fontSize:11,letterSpacing:"0.12em",color:DIM,fontWeight:600,marginBottom:16 } }, "TIMER DURATIONS (MIN)"),
         [["pomo","Pomodoro"],["short","Short break"],["long","Long break"],["cycle","Long break every (sessions)"]].map(([k, l]) =>
           h("div", { key:k, style: { display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:11 } },
@@ -457,11 +569,28 @@
             }
           }),
           h("span", { style: { fontSize:12,fontFamily:"JetBrains Mono,monospace",color:MUTED,minWidth:34,textAlign:"right" } }, `${Math.round(vol*100)}%`)
+        ),
+        h("div", { style: { height:1,background:BORDER,margin:"18px 0" } }),
+        h("p", { style: { fontSize:11,letterSpacing:"0.12em",color:DIM,fontWeight:600,marginBottom:14 } }, "BROWSER NOTIFICATIONS"),
+        h("div", { style: { display:"flex",alignItems:"center",justifyContent:"space-between" } },
+          h("span", { style: { fontSize:13,color:MUTED } },
+            notifPerm === "granted"  ? "✓ Enabled" :
+            notifPerm === "denied"   ? "Blocked in browser settings" :
+            "Get notified when a session ends"
+          ),
+          notifPerm !== "granted" && notifPerm !== "denied" &&
+            h("button", {
+              style: { ...chip(false), fontSize:12 },
+              onClick: askNotifPerm
+            }, "Enable")
+        ),
+        notifPerm === "denied" && h("p", { style: { fontSize:11,color:DIM,marginTop:6,lineHeight:1.5 } },
+          "To enable: click the lock icon in the address bar → Notifications → Allow."
         )
       ),
 
       // ── about panel ──
-      showAbout && h("div", { style: { width:"100%",maxWidth:400,background:CARD,borderRadius:16,border:`1px solid ${BORDER}`,padding:"22px 24px",marginTop:12 } },
+      showAbout && h("div", { style: { width:"100%",maxWidth:460,background:CARD,borderRadius:16,border:`1px solid ${BORDER}`,padding:"22px 24px",marginTop:12 } },
         h("p", { style: { fontSize:11,letterSpacing:"0.12em",color:DIM,fontWeight:600,marginBottom:16 } }, "ABOUT"),
         h("p", { style: { fontSize:14,color:MUTED,lineHeight:1.7,marginBottom:20 } },
           "A clean, distraction-free Pomodoro timer. No accounts, no tracking, works offline. Your settings and session count are saved locally in your browser."
